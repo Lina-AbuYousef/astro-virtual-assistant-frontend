@@ -6,6 +6,7 @@ import { useFlag } from '@unleash/proxy-client-react';
 
 import { Models, StateManagerConfiguration, UseManagerHook } from './types';
 import { MAS_ENABLED_FLAG } from './flags';
+import { scheduleTokenRefresh } from './useMasTokenRefresh';
 import MASFooter from '../Components/MASClient/MASFooter';
 import MASMessageEntry from '../Components/MASClient/MASMessageEntry';
 
@@ -67,6 +68,16 @@ function useMasClient(): UseManagerHook {
           token = (user as { access_token?: string } | null | undefined)?.access_token;
           if (!token) {
             throw new Error('Failed to refresh authentication');
+          }
+          // Start mid-session token refresh monitor so the running Temporal
+          // workflow always has a valid token for downstream sub-agent calls.
+          try {
+            const body = typeof options?.body === 'string' ? JSON.parse(options.body) : {};
+            if (body.sessionId) {
+              scheduleTokenRefresh(body.sessionId, token, baseUrl, chrome);
+            }
+          } catch {
+            // Non-critical — never block the session submit.
           }
         } else {
           token = await chrome.auth.getToken();
