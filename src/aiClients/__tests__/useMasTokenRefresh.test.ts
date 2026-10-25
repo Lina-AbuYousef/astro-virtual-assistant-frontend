@@ -156,6 +156,9 @@ describe('scheduleTokenRefresh', () => {
     await Promise.resolve();
     await Promise.resolve(); // flush async fetch
 
+    // The fresh token is sent only in the Authorization header (already validated
+    // by @require_auth on the backend). The body contains only the sessionId —
+    // no separate token field — mirroring the session.submit design.
     expect(global.fetch).toHaveBeenCalledWith(
       `${BASE_URL}/api/sessions/session.token-refresh`,
       expect.objectContaining({
@@ -164,7 +167,7 @@ describe('scheduleTokenRefresh', () => {
           'Content-Type': 'application/json',
           Authorization: 'Bearer refreshed-token',
         }),
-        body: JSON.stringify({ sessionId: 'session-1', token: 'refreshed-token' }),
+        body: JSON.stringify({ sessionId: 'session-1' }),
       })
     );
   });
@@ -185,8 +188,23 @@ describe('scheduleTokenRefresh', () => {
     consoleSpy.mockRestore();
   });
 
-  it('stops the monitor when the backend returns 404 (session ended)', async () => {
+  it('stops the monitor when the backend returns 404 (session unknown)', async () => {
     (global.fetch as jest.Mock).mockResolvedValue({ ok: false, status: 404 });
+
+    const token = jwtExpiringIn(900);
+    await scheduleTokenRefresh('session-1', token, BASE_URL, mockChrome);
+
+    jest.advanceTimersByTime(13 * 60 * 1000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(activeRefreshTimers.has('session-1')).toBe(false);
+    // Should not reschedule — fetch called exactly once
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops the monitor when the backend returns 410 (session has ended)', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue({ ok: false, status: 410 });
 
     const token = jwtExpiringIn(900);
     await scheduleTokenRefresh('session-1', token, BASE_URL, mockChrome);
