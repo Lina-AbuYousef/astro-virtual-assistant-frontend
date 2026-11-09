@@ -78,11 +78,12 @@ export async function scheduleTokenRefresh(
           'Content-Type': 'application/json',
           Authorization: `Bearer ${newToken}`,
         },
-        body: JSON.stringify({ sessionId, token: newToken }),
+        body: JSON.stringify({ sessionId }),
       });
 
-      if (response.status === 404) {
-        // Session has ended — clean up and stop.
+      if (response.status === 404 || response.status === 410) {
+        // 404 — session ID unknown; 410 — session existed but has ended.
+        // Either way, stop the monitor.
         activeRefreshTimers.delete(sessionId);
         return;
       }
