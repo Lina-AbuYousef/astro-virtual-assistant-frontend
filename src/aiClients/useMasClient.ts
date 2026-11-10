@@ -6,7 +6,7 @@ import { useFlag } from '@unleash/proxy-client-react';
 
 import { Models, StateManagerConfiguration, UseManagerHook } from './types';
 import { MAS_ENABLED_FLAG } from './flags';
-import { scheduleTokenRefresh } from './useMasTokenRefresh';
+import { createMasFetch } from './masAuthFetch';
 import MASFooter from '../Components/MASClient/MASFooter';
 import MASMessageEntry from '../Components/MASClient/MASMessageEntry';
 
@@ -58,41 +58,10 @@ function useMasClient(): UseManagerHook {
     const client = new MASClient({
       baseUrl,
       blueprintId: MAS_BLUEPRINT_ID,
-      fetchFunction: async (input, options) => {
-        // Refresh token if the request is to the user.session.submit endpoint
-        // TODO(RHCLOUD-52092): Replace with getToken({ minValidity: 420 }) when available.
-        const requestUrl = typeof input === 'string' ? input : input instanceof URL ? input?.href : input?.url ?? '';
-        let token: string | undefined;
-        if (requestUrl && requestUrl.includes('api/sessions/user.session.submit')) {
-          const user = await chrome.$internal.forceAuthRefresh();
-          token = (user as { access_token?: string } | null | undefined)?.access_token;
-          if (!token) {
-            throw new Error('Failed to refresh authentication');
-          }
-          // Start mid-session token refresh monitor so the running Temporal
-          // workflow always has a valid token for downstream sub-agent calls.
-          try {
-            const body = typeof options?.body === 'string' ? JSON.parse(options.body) : {};
-            if (body.sessionId) {
-              scheduleTokenRefresh(body.sessionId, token, baseUrl, chrome);
-            }
-          } catch {
-            // Non-critical — never block the session submit.
-          }
-        } else {
-          token = await chrome.auth.getToken();
-        }
-        if (!token) {
-          throw new Error('User is not authenticated');
-        }
-        return fetch(input, {
-          ...options,
-          headers: {
-            ...options?.headers,
-            Authorization: `Bearer ${token}`,
-          },
-        });
-      },
+      // Adds the bearer token and keeps the mid-session token refresh monitor
+      // in step with the session (starts after a successful submit or when a
+      // running conversation is reopened).
+      fetchFunction: createMasFetch({ baseUrl, chrome }),
     });
     const stateManager = createClientStateManager(client);
 
