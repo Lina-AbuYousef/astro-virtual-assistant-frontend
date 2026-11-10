@@ -120,9 +120,9 @@ async function runCycle(monitor: Monitor): Promise<void> {
     });
     if (!isCurrent(monitor)) return;
 
-    if (response.status === 404 || response.status === 410) {
-      // 404 — session ID unknown; 410 — session existed but has ended.
-      // The only responses that mean "stop for good".
+    if (response.status === 403 || response.status === 404 || response.status === 410) {
+      // 403 — forbidden; 404 — session ID unknown; 410 — session existed but has ended.
+      // Retrying cannot change any of these: stop for good.
       retire(monitor);
       return;
     }
@@ -166,8 +166,8 @@ async function runCycle(monitor: Monitor): Promise<void> {
  * HCC Chrome, then POSTs the new token to the MAS backend so the running
  * Temporal workflow picks it up for the next sub-agent call.
  *
- * It stops for good when the backend answers 404 (unknown session) or 410
- * (session ended). Network errors, 5xx, and other failures are retried with
+ * It stops for good when the backend answers 403 (forbidden), 404 (unknown
+ * session) or 410 (session ended). Network errors, 5xx, and other failures are retried with
  * backoff. Never throws.
  */
 export function ensureTokenRefreshMonitor(sessionId: string, token: string, baseUrl: string, chrome: ChromeAuth): void {

@@ -279,6 +279,7 @@ describe('after a successful refresh', () => {
 // ─── Permanent stop ───────────────────────────────────────────────────────────
 
 describe.each([
+  [403, 'forbidden'],
   [404, 'session unknown'],
   [410, 'session ended'],
 ])('when the backend returns %i (%s)', (status) => {
