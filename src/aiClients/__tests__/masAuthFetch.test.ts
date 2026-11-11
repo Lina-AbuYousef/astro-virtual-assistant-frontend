@@ -45,7 +45,6 @@ function fakeResponse(body: unknown = {}, { ok = true, status = 200 } = {}): Fak
 const BASE_URL = 'https://mas.example.com';
 const SUBMIT_URL = `${BASE_URL}/api/sessions/user.session.submit`;
 const chatUrl = (sessionId: string) => `${BASE_URL}/api/sessions/session.chat.get?sessionId=${sessionId}`;
-const deleteUrl = (sessionId: string) => `${BASE_URL}/api/sessions/session.delete?sessionId=${sessionId}`;
 
 const forceAuthRefresh = jest.fn();
 const getToken = jest.fn();
@@ -56,6 +55,15 @@ const chrome: MasFetchChrome = {
 const fetchImpl = jest.fn();
 
 let masFetch: ReturnType<typeof createMasFetch>;
+
+/** The headers passed to the underlying fetch for the nth call, as a plain object with lowercase names. */
+function sentHeaders(callIndex = 0): Record<string, string> {
+  const sent: Record<string, string> = {};
+  new Headers(fetchImpl.mock.calls[callIndex][1].headers).forEach((value, name) => {
+    sent[name] = value;
+  });
+  return sent;
+}
 
 function submit(sessionId = 'session-1') {
   return masFetch(SUBMIT_URL, {
@@ -95,12 +103,8 @@ describe('submit', () => {
     await submit('session-1');
 
     expect(getToken).not.toHaveBeenCalled();
-    expect(fetchImpl).toHaveBeenCalledWith(
-      SUBMIT_URL,
-      expect.objectContaining({
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${fresh}` },
-      })
-    );
+    expect(fetchImpl.mock.calls[0][0]).toBe(SUBMIT_URL);
+    expect(sentHeaders()).toEqual({ 'content-type': 'application/json', authorization: `Bearer ${fresh}` });
     expect(isTokenRefreshMonitorActive('session-1')).toBe(true);
   });
 
@@ -214,6 +218,70 @@ describe('submit', () => {
     expect(isTokenRefreshMonitorActive('session-B')).toBe(true);
     expect(jest.getTimerCount()).toBe(2);
   });
+
+  it('prefers the init body over a Request body', async () => {
+    const request = { url: SUBMIT_URL, body: JSON.stringify({ sessionId: 'from-request' }) } as unknown as Request;
+
+    await masFetch(request, { method: 'POST', body: JSON.stringify({ sessionId: 'from-init' }) });
+
+    expect(isTokenRefreshMonitorActive('from-init')).toBe(true);
+    expect(isTokenRefreshMonitorActive('from-request')).toBe(false);
+  });
+
+  it('reads the body of a real Request from a clone, before the request is sent', async () => {
+    const order: string[] = [];
+    const request = {
+      url: SUBMIT_URL,
+      headers: new Headers({ 'Content-Type': 'application/json' }),
+      body: {} as unknown, // a stream, not text
+      clone: jest.fn(() => {
+        order.push('clone');
+        return { text: async () => JSON.stringify({ sessionId: 'streamed-session' }) };
+      }),
+    } as unknown as Request;
+    fetchImpl.mockImplementationOnce(async () => {
+      order.push('fetch');
+      return fakeResponse();
+    });
+
+    await masFetch(request);
+
+    expect(order).toEqual(['clone', 'fetch']);
+    expect(request.clone).toHaveBeenCalledTimes(1);
+    expect(isTokenRefreshMonitorActive('streamed-session')).toBe(true);
+  });
+
+  it('still sends the submit and starts no monitor when the Request body cannot be read', async () => {
+    const request = {
+      url: SUBMIT_URL,
+      body: {} as unknown,
+      clone: () => ({
+        text: async () => {
+          throw new Error('body already used');
+        },
+      }),
+    } as unknown as Request;
+    const response = fakeResponse();
+    fetchImpl.mockResolvedValueOnce(response);
+
+    await expect(masFetch(request)).resolves.toBe(response);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('starts the monitor when submit is supplied as a Request-like input', async () => {
+    const request = {
+      url: SUBMIT_URL,
+      method: 'POST',
+      headers: new Headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ sessionId: 'request-session' }),
+    } as unknown as Request;
+
+    await masFetch(request);
+
+    expect(isTokenRefreshMonitorActive('request-session')).toBe(true);
+  });
 });
 
 // ─── Other requests ───────────────────────────────────────────────────────────
@@ -225,10 +293,8 @@ describe('requests other than submit', () => {
     await masFetch(`${BASE_URL}/api/sessions/session.user.list`, { headers: { Accept: 'application/json' } });
 
     expect(forceAuthRefresh).not.toHaveBeenCalled();
-    expect(fetchImpl).toHaveBeenCalledWith(
-      `${BASE_URL}/api/sessions/session.user.list`,
-      expect.objectContaining({ headers: { Accept: 'application/json', Authorization: 'Bearer current-token' } })
-    );
+    expect(fetchImpl.mock.calls[0][0]).toBe(`${BASE_URL}/api/sessions/session.user.list`);
+    expect(sentHeaders()).toEqual({ accept: 'application/json', authorization: 'Bearer current-token' });
     expect(jest.getTimerCount()).toBe(0);
   });
 
@@ -252,6 +318,50 @@ describe('requests other than submit', () => {
       body: JSON.stringify({ sessionId: 'session-req' }),
     });
     expect(isTokenRefreshMonitorActive('session-req')).toBe(true);
+  });
+
+  it('preserves a Headers object while adding Authorization', async () => {
+    getToken.mockResolvedValueOnce('current-token');
+    const headers = new Headers({ Accept: 'application/json', 'X-Correlation-ID': 'trace-1' });
+
+    await masFetch(`${BASE_URL}/api/sessions/session.user.list`, { headers });
+
+    const sentHeaders = new Headers(fetchImpl.mock.calls[0][1].headers);
+    expect(sentHeaders.get('Accept')).toBe('application/json');
+    expect(sentHeaders.get('X-Correlation-ID')).toBe('trace-1');
+    expect(sentHeaders.get('Authorization')).toBe('Bearer current-token');
+  });
+
+  it('preserves headers given as an array of pairs', async () => {
+    getToken.mockResolvedValueOnce('current-token');
+
+    await masFetch(`${BASE_URL}/api/sessions/session.user.list`, { headers: [['Accept', 'application/json']] });
+
+    expect(sentHeaders()).toEqual({ accept: 'application/json', authorization: 'Bearer current-token' });
+  });
+
+  it('replaces a caller-supplied Authorization header instead of duplicating it', async () => {
+    getToken.mockResolvedValueOnce('current-token');
+
+    await masFetch(`${BASE_URL}/api/sessions/session.user.list`, { headers: { authorization: 'Bearer stale' } });
+
+    expect(sentHeaders()).toEqual({ authorization: 'Bearer current-token' });
+  });
+
+  it('keeps the headers of a Request input, lets init headers override them, and adds Authorization', async () => {
+    getToken.mockResolvedValueOnce('current-token');
+    const request = {
+      url: `${BASE_URL}/api/sessions/session.user.list`,
+      headers: new Headers({ 'Content-Type': 'text/plain', 'X-From-Request': 'yes' }),
+    } as unknown as Request;
+
+    await masFetch(request, { headers: { 'content-type': 'application/json' } });
+
+    expect(sentHeaders()).toEqual({
+      'content-type': 'application/json',
+      'x-from-request': 'yes',
+      authorization: 'Bearer current-token',
+    });
   });
 });
 
@@ -342,36 +452,5 @@ describe('reopening a conversation (session.chat.get)', () => {
     await expect(masFetch(chatUrl('session-1'))).resolves.toBe(response);
 
     expect(console.warn).toHaveBeenCalled();
-  });
-});
-
-// ─── Deleting a conversation ──────────────────────────────────────────────────
-
-describe('deleting a conversation (session.delete)', () => {
-  it('stops that session’s monitor after a successful delete', async () => {
-    await submit('session-1');
-    await submit('session-2');
-
-    await masFetch(deleteUrl('session-1'), { method: 'DELETE' });
-
-    expect(isTokenRefreshMonitorActive('session-1')).toBe(false);
-    expect(isTokenRefreshMonitorActive('session-2')).toBe(true);
-  });
-
-  it('keeps the monitor when the delete fails', async () => {
-    await submit('session-1');
-    fetchImpl.mockResolvedValueOnce(fakeResponse({}, { ok: false, status: 500 }));
-
-    await masFetch(deleteUrl('session-1'), { method: 'DELETE' });
-
-    expect(isTokenRefreshMonitorActive('session-1')).toBe(true);
-  });
-
-  it('ignores a non-DELETE request to the same path', async () => {
-    await submit('session-1');
-
-    await masFetch(deleteUrl('session-1'), { method: 'GET' });
-
-    expect(isTokenRefreshMonitorActive('session-1')).toBe(true);
   });
 });

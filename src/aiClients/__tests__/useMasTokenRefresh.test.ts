@@ -114,9 +114,19 @@ describe('getTokenExpMs', () => {
     expect(getTokenExpMs(`${header}.${payload}.sig`)).toBeNull();
   });
 
-  it('handles base64url encoding (- and _ characters)', () => {
+  it('handles base64url encoding (- and _ characters, no padding)', () => {
     const expSeconds = 9999999999;
-    expect(getTokenExpMs(makeJwt(expSeconds))).toBe(expSeconds * 1000);
+    // "???" and ">>>" are 3-byte aligned here and encode to "Pz8/" and "Pj4+",
+    // so the standard base64 payload contains "/" and "+".
+    const standard = btoa(JSON.stringify({ sub: 'user-1', note: '???>>>', exp: expSeconds }));
+    expect(standard).toMatch(/[+/]/); // guard: the test must really exercise the url-safe alphabet
+
+    const urlSafe = standard.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    expect(urlSafe).toMatch(/[-_]/);
+    expect(urlSafe).not.toMatch(/[+/=]/);
+
+    const header = btoa(JSON.stringify({ alg: 'RS256' }));
+    expect(getTokenExpMs(`${header}.${urlSafe}.sig`)).toBe(expSeconds * 1000);
   });
 });
 
