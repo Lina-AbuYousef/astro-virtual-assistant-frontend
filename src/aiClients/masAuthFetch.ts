@@ -1,4 +1,4 @@
-import { ChromeAuth, ensureTokenRefreshMonitor, stopTokenRefreshMonitor } from './useMasTokenRefresh';
+import { ChromeAuth, ensureTokenRefreshMonitor } from './useMasTokenRefresh';
 
 /** The slice of the HCC Chrome API the MAS fetch wrapper needs. */
 export type MasFetchChrome = ChromeAuth & {
@@ -9,7 +9,6 @@ type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respo
 
 const SUBMIT_PATH = 'api/sessions/user.session.submit';
 const CHAT_GET_PATH = 'api/sessions/session.chat.get';
-const DELETE_PATH = 'api/sessions/session.delete';
 
 /** Backend statuses in which a session accepts token refreshes (anything else answers 410). */
 const ACTIVE_STATUSES = new Set(['RUNNING', 'QUEUED']);
@@ -43,7 +42,6 @@ function getSessionIdFromBody(body: RequestInit['body']): string | undefined {
  * - submit succeeded      → the session is running: make sure a monitor exists.
  * - chat state is active  → a running conversation was reopened or reconnected
  *                           (page reload, switching conversations): make sure a monitor exists.
- * - session deleted       → it no longer exists: stop.
  *
  * Deliberately does NOT stop on a COMPLETED/FAILED/CANCELLED chat state: that
  * reading can be stale (it may predate a follow-up submit). The backend's
@@ -80,12 +78,6 @@ function observeResponse(
       .catch(() => {
         // Not JSON / unreadable — monitoring is best-effort, never affects the request.
       });
-    return;
-  }
-
-  if (requestUrl.includes(DELETE_PATH) && options?.method?.toUpperCase() === 'DELETE' && response.ok) {
-    const sessionId = getSessionIdFromUrl(requestUrl);
-    if (sessionId) stopTokenRefreshMonitor(sessionId);
   }
 }
 
