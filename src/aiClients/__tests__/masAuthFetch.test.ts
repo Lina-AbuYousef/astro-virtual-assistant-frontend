@@ -256,9 +256,34 @@ describe('requests other than submit', () => {
 
 // ─── Reopening / reconnecting a conversation ──────────────────────────────────
 
+const STATUS_URL = (sessionId: string) => `${BASE_URL}/api/sessions/session.status.get?sessionId=${sessionId}`;
+
+/** chat.get answers with `chat`; session.status.get answers with `status` (or fails when given an Error). */
+function routeFetch(chat: FakeResponse, status: FakeResponse | Error | Promise<never>) {
+  fetchImpl.mockImplementation(async (url: string) => {
+    if (String(url).includes('session.status.get')) {
+      if (status instanceof Error) throw status;
+      return status;
+    }
+    return chat;
+  });
+}
+
+/** chat.get is admin-only on the backend, so a normal user gets this. */
+const forbidden = () => fakeResponse({ error: 'Admin access required' }, { ok: false, status: 403 });
+
 describe('reopening a conversation (session.chat.get)', () => {
-  it.each(['RUNNING', 'QUEUED'])('starts the monitor when the session is %s (e.g. after a page reload)', async (status) => {
-    fetchImpl.mockResolvedValueOnce(fakeResponse({ messages: [], status }));
+  it.each(['RUNNING', 'QUEUED'])('starts the monitor when the session is %s, although chat.get is forbidden (403)', async (status) => {
+    routeFetch(forbidden(), fakeResponse(status));
+
+    await masFetch(chatUrl('session-1'));
+    await advance(0);
+
+    expect(isTokenRefreshMonitorActive('session-1')).toBe(true);
+  });
+
+  it('also starts the monitor when chat.get itself succeeds', async () => {
+    routeFetch(fakeResponse({ messages: [] }), fakeResponse('RUNNING'));
 
     await masFetch(chatUrl('session-1'));
     await advance(0);
@@ -267,7 +292,7 @@ describe('reopening a conversation (session.chat.get)', () => {
   });
 
   it.each(['COMPLETED', 'FAILED', 'CANCELLED', 'PENDING', 'LOCKED', 'IN_USE'])('starts no monitor when the session is %s', async (status) => {
-    fetchImpl.mockResolvedValueOnce(fakeResponse({ messages: [], status }));
+    routeFetch(forbidden(), fakeResponse(status));
 
     await masFetch(chatUrl('session-1'));
     await advance(0);
@@ -275,71 +300,117 @@ describe('reopening a conversation (session.chat.get)', () => {
     expect(isTokenRefreshMonitorActive('session-1')).toBe(false);
   });
 
-  it('does not stop a running monitor on a terminal status (that reading can be stale; 404/410 decides)', async () => {
-    await submit('session-1');
-    expect(isTokenRefreshMonitorActive('session-1')).toBe(true);
-    fetchImpl.mockResolvedValueOnce(fakeResponse({ messages: [], status: 'COMPLETED' }));
+  it('asks session.status.get with the current token as a plain GET, without forcing an auth refresh', async () => {
+    getToken.mockResolvedValue('current-token');
+    routeFetch(forbidden(), fakeResponse('COMPLETED'));
 
     await masFetch(chatUrl('session-1'));
     await advance(0);
 
-    expect(isTokenRefreshMonitorActive('session-1')).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl.mock.calls[1][0]).toBe(STATUS_URL('session-1'));
+    expect(fetchImpl.mock.calls[1][1]).toEqual({ method: 'GET', headers: { Authorization: 'Bearer current-token' } });
+    expect(forceAuthRefresh).not.toHaveBeenCalled();
   });
 
-  it('does not add a second monitor when one is already running', async () => {
+  it('returns the chat.get response untouched and does not wait for the status check', async () => {
+    const chat = forbidden();
+    routeFetch(chat, new Promise<never>(() => undefined)); // the status check never answers
+
+    await expect(masFetch(chatUrl('session-1'))).resolves.toBe(chat);
+
+    expect(chat.consumed).toBe(false);
+  });
+
+  it('does not ask again when a monitor is already running for the session', async () => {
     await submit('session-1');
-    fetchImpl.mockResolvedValueOnce(fakeResponse({ messages: [], status: 'RUNNING' }));
+    fetchImpl.mockClear();
+    routeFetch(forbidden(), fakeResponse('RUNNING'));
 
     await masFetch(chatUrl('session-1'));
     await advance(0);
 
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // only the chat.get itself
     expect(jest.getTimerCount()).toBe(1);
   });
 
-  it('reads the state from a clone, leaving the body for the caller', async () => {
-    const response = fakeResponse({ messages: [], status: 'RUNNING' });
-    fetchImpl.mockResolvedValueOnce(response);
+  it('does not stop a running monitor when the status says it is finished (that reading can be stale)', async () => {
+    await submit('session-1');
+    routeFetch(forbidden(), fakeResponse('COMPLETED'));
 
-    const returned = (await masFetch(chatUrl('session-1'))) as unknown as FakeResponse;
+    await masFetch(chatUrl('session-1'));
     await advance(0);
 
-    expect(returned).toBe(response);
-    expect(response.clone).toHaveBeenCalledTimes(1);
-    expect(response.consumed).toBe(false);
+    expect(isTokenRefreshMonitorActive('session-1')).toBe(true);
   });
 
   it.each([
-    ['a non-OK response', fakeResponse({ status: 'RUNNING' }, { ok: false, status: 500 })],
+    ['a non-OK answer (the backend answers 500 for an unknown session)', fakeResponse({ error: 'No session' }, { ok: false, status: 500 })],
     ['a body that is not JSON', fakeResponse(new Error('Unexpected token'))],
-    ['a body with no status', fakeResponse({ messages: [] })],
+    ['a body that is not a string', fakeResponse({ status: 'RUNNING' })],
     ['a null body', fakeResponse(null)],
-  ])('starts no monitor and does not throw on %s', async (_name, response) => {
-    fetchImpl.mockResolvedValueOnce(response);
+    ['a network error', new Error('Network error')],
+  ])('starts no monitor and does not break the request on %s', async (_name, status) => {
+    const chat = forbidden();
+    routeFetch(chat, status);
 
-    await expect(masFetch(chatUrl('session-1'))).resolves.toBe(response);
+    await expect(masFetch(chatUrl('session-1'))).resolves.toBe(chat);
     await advance(0);
 
     expect(isTokenRefreshMonitorActive('session-1')).toBe(false);
   });
 
-  it('starts no monitor when the URL has no sessionId', async () => {
-    fetchImpl.mockResolvedValueOnce(fakeResponse({ status: 'RUNNING' }));
+  it('does nothing when the URL has no sessionId', async () => {
+    routeFetch(forbidden(), fakeResponse('RUNNING'));
 
     await masFetch(`${BASE_URL}/api/sessions/session.chat.get`);
     await advance(0);
 
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(jest.getTimerCount()).toBe(0);
   });
 
-  it('never breaks the request when the monitor bookkeeping throws', async () => {
-    const response = fakeResponse({ status: 'RUNNING' });
-    response.clone.mockImplementation(() => {
-      throw new Error('clone failed');
-    });
-    fetchImpl.mockResolvedValueOnce(response);
+  it('does not ask about the status for other kinds of request', async () => {
+    routeFetch(forbidden(), fakeResponse('RUNNING'));
 
-    await expect(masFetch(chatUrl('session-1'))).resolves.toBe(response);
+    await masFetch(`${BASE_URL}/api/sessions/session.user.list`);
+    await advance(0);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('never breaks the request when the status check throws immediately', async () => {
+    const chat = forbidden();
+    fetchImpl.mockImplementation((url: string) => {
+      if (String(url).includes('session.status.get')) throw new Error('boom');
+      return Promise.resolve(chat);
+    });
+
+    await expect(masFetch(chatUrl('session-1'))).resolves.toBe(chat);
 
     expect(console.warn).toHaveBeenCalled();
+  });
+
+  it('after a reload with a running workflow, the restarted monitor refreshes the token', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+    try {
+      routeFetch(forbidden(), fakeResponse('RUNNING'));
+
+      await masFetch(chatUrl('session-1'));
+      await advance(0);
+      expect(isTokenRefreshMonitorActive('session-1')).toBe(true);
+
+      await advance(14 * 60 * 1000); // past the first refresh deadline of a 15-minute token
+
+      expect(forceAuthRefresh).toHaveBeenCalled();
+      expect(global.fetch).toHaveBeenCalledWith(
+        `${BASE_URL}/api/sessions/session.token-refresh`,
+        expect.objectContaining({ method: 'POST', body: JSON.stringify({ sessionId: 'session-1' }) })
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
   });
 });

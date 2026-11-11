@@ -1,4 +1,4 @@
-import { ChromeAuth, ensureTokenRefreshMonitor } from './useMasTokenRefresh';
+import { ChromeAuth, ensureTokenRefreshMonitor, isTokenRefreshMonitorActive } from './useMasTokenRefresh';
 
 /** The slice of the HCC Chrome API the MAS fetch wrapper needs. */
 export type MasFetchChrome = ChromeAuth & {
@@ -9,6 +9,7 @@ type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respo
 
 const SUBMIT_PATH = 'api/sessions/user.session.submit';
 const CHAT_GET_PATH = 'api/sessions/session.chat.get';
+const STATUS_PATH = 'api/sessions/session.status.get';
 
 /** Backend statuses in which a session accepts token refreshes (anything else answers 410). */
 const ACTIVE_STATUSES = new Set(['RUNNING', 'QUEUED']);
@@ -36,17 +37,45 @@ function getSessionIdFromBody(body: RequestInit['body']): string | undefined {
 }
 
 /**
+ * Ask the backend whether a session is running and, if so, make sure its token
+ * refresh monitor exists. Used when a conversation is reopened (page reload,
+ * switching conversations).
+ *
+ * Uses session.status.get, which any logged-in user may call. The history
+ * request the UI makes (session.chat.get) is admin-only, so its answer cannot
+ * be relied on. Best-effort: any failure leaves things as they were.
+ */
+function ensureMonitorIfSessionIsActive(sessionId: string, token: string, baseUrl: string, chrome: MasFetchChrome, doFetch: FetchLike): void {
+  if (isTokenRefreshMonitorActive(sessionId)) return;
+  doFetch(`${baseUrl}/${STATUS_PATH}?sessionId=${encodeURIComponent(sessionId)}`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+    .then((response) => (response.ok ? response.json() : null))
+    .then((status) => {
+      // The endpoint answers with the bare status string, e.g. "RUNNING".
+      if (typeof status === 'string' && ACTIVE_STATUSES.has(status)) {
+        ensureTokenRefreshMonitor(sessionId, token, baseUrl, chrome);
+      }
+    })
+    .catch(() => {
+      // Unreachable, not OK, or unreadable — monitoring is best-effort.
+    });
+}
+
+/**
  * Decide, from a completed MAS request, whether a session's token refresh
- * monitor should start or stop.
+ * monitor should start.
  *
- * - submit succeeded      → the session is running: make sure a monitor exists.
- * - chat state is active  → a running conversation was reopened or reconnected
- *                           (page reload, switching conversations): make sure a monitor exists.
+ * - submit succeeded       → the session is running: make sure a monitor exists.
+ * - history was requested  → a conversation was reopened (page reload, switching
+ *                            conversations): if the session is still running,
+ *                            make sure a monitor exists. The answer to the history
+ *                            request itself is irrelevant, it may be forbidden.
  *
- * Deliberately does NOT stop on a COMPLETED/FAILED/CANCELLED chat state: that
- * reading can be stale (it may predate a follow-up submit). The backend's
- * 404/410 on the next refresh is the authoritative signal and stops the
- * monitor on its own.
+ * Monitors are never stopped from here. A stale COMPLETED/FAILED reading could
+ * predate a follow-up submit; the backend's 404/410 on the next refresh is the
+ * authoritative signal and stops the monitor on its own.
  */
 function observeResponse(
   requestUrl: string,
@@ -54,7 +83,8 @@ function observeResponse(
   response: Response,
   token: string,
   baseUrl: string,
-  chrome: MasFetchChrome
+  chrome: MasFetchChrome,
+  doFetch: FetchLike
 ): void {
   if (requestUrl.includes(SUBMIT_PATH)) {
     if (!response.ok) return;
@@ -65,19 +95,7 @@ function observeResponse(
 
   if (requestUrl.includes(CHAT_GET_PATH)) {
     const sessionId = getSessionIdFromUrl(requestUrl);
-    if (!sessionId || !response.ok) return;
-    // Read a clone so the caller's own consumption of the body is untouched.
-    response
-      .clone()
-      .json()
-      .then((chatState: { status?: string } | null) => {
-        if (chatState?.status && ACTIVE_STATUSES.has(chatState.status)) {
-          ensureTokenRefreshMonitor(sessionId, token, baseUrl, chrome);
-        }
-      })
-      .catch(() => {
-        // Not JSON / unreadable — monitoring is best-effort, never affects the request.
-      });
+    if (sessionId) ensureMonitorIfSessionIsActive(sessionId, token, baseUrl, chrome, doFetch);
   }
 }
 
@@ -90,6 +108,7 @@ function observeResponse(
  * alter the request itself.
  */
 export function createMasFetch({ baseUrl, chrome, fetchImpl }: { baseUrl: string; chrome: MasFetchChrome; fetchImpl?: FetchLike }): FetchLike {
+  const doFetch: FetchLike = fetchImpl ?? ((i, o) => fetch(i, o));
   return async (input, options) => {
     const requestUrl = getRequestUrl(input);
     const isSubmit = !!requestUrl && requestUrl.includes(SUBMIT_PATH);
@@ -109,7 +128,7 @@ export function createMasFetch({ baseUrl, chrome, fetchImpl }: { baseUrl: string
       throw new Error('User is not authenticated');
     }
 
-    const response = await (fetchImpl ?? ((i, o) => fetch(i, o)))(input, {
+    const response = await doFetch(input, {
       ...options,
       headers: {
         ...options?.headers,
@@ -118,7 +137,7 @@ export function createMasFetch({ baseUrl, chrome, fetchImpl }: { baseUrl: string
     });
 
     try {
-      observeResponse(requestUrl, options, response, token, baseUrl, chrome);
+      observeResponse(requestUrl, options, response, token, baseUrl, chrome, doFetch);
     } catch (err) {
       console.warn('[MAS token-refresh] could not update the monitor for this request', err);
     }
