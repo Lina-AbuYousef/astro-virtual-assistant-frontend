@@ -26,7 +26,8 @@ export function getTokenExpMs(token: string): number | null {
 }
 
 /** How long before the token expires a refresh is attempted. */
-const REFRESH_LEAD_MS = 2 * 60 * 1000;
+// LOCAL TESTING ONLY - do not commit. Real value: 2 * 60 * 1000. With ~15 min tokens, a 13 min lead refreshes about every 2 min.
+const REFRESH_LEAD_MS = 5 * 60 * 1000;
 /** Lower bound between cycles after a successful refresh, so a short-lived token can never cause a request loop. */
 const MIN_REARM_DELAY_MS = 30 * 1000;
 /** Retry backoff after a transient failure: 5s, 15s, 45s, then capped. */
