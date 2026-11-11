@@ -25,7 +25,7 @@ function getSessionIdFromUrl(requestUrl: string): string | undefined {
   }
 }
 
-function getSessionIdFromBody(body: RequestInit['body'] | undefined): string | undefined {
+function getSessionIdFromBody(body: RequestInit['body']): string | undefined {
   if (typeof body !== 'string') return undefined;
   try {
     const sessionId = JSON.parse(body)?.sessionId;
@@ -33,58 +33,6 @@ function getSessionIdFromBody(body: RequestInit['body'] | undefined): string | u
   } catch {
     return undefined;
   }
-}
-
-/** A `Request` (or an object shaped like one) as opposed to a URL string or `URL`. */
-function isRequestLike(input: RequestInfo | URL): input is Request {
-  return typeof input === 'object' && input !== null && !(input instanceof URL);
-}
-
-/**
- * The headers to send, as a plain object: the request's own headers, then the
- * init headers on top, then the bearer token. Accepts a plain object, an array
- * of pairs, or a `Headers` instance (spreading a `Headers` would drop every
- * entry). Names are matched case-insensitively, so a caller-supplied
- * Authorization or Content-Type is replaced, not duplicated.
- */
-function buildHeaders(input: RequestInfo | URL, options: RequestInit | undefined, token: string): Record<string, string> {
-  const merged = new Map<string, [name: string, value: string]>();
-  const add = (name: string, value: string) => merged.set(name.toLowerCase(), [name, value]);
-  const addAll = (source: HeadersInit | undefined) => {
-    if (!source) return;
-    if (Array.isArray(source)) {
-      source.forEach(([name, value]) => add(name, value));
-    } else if (typeof (source as Headers).forEach === 'function') {
-      (source as Headers).forEach((value, name) => add(name, value));
-    } else {
-      Object.entries(source).forEach(([name, value]) => add(name, value));
-    }
-  };
-
-  addAll(isRequestLike(input) ? input.headers : undefined);
-  addAll(options?.headers);
-  add('Authorization', `Bearer ${token}`);
-  return Object.fromEntries(merged.values());
-}
-
-/**
- * The body of a submit request, read BEFORE the request is sent (a real
- * `Request` body can only be consumed once). Prefers the init body, then the
- * `Request`'s own. Returns undefined when it cannot be read; never throws.
- */
-async function readSubmitBody(input: RequestInfo | URL, options: RequestInit | undefined): Promise<RequestInit['body'] | undefined> {
-  if (options?.body !== undefined && options.body !== null) return options.body;
-  if (!isRequestLike(input)) return undefined;
-  const body: unknown = input.body;
-  if (typeof body === 'string') return body; // a Request-like object carrying its body as text
-  if (typeof input.clone === 'function') {
-    try {
-      return await input.clone().text();
-    } catch {
-      return undefined;
-    }
-  }
-  return undefined;
 }
 
 /**
@@ -102,7 +50,7 @@ async function readSubmitBody(input: RequestInfo | URL, options: RequestInit | u
  */
 function observeResponse(
   requestUrl: string,
-  submitBody: RequestInit['body'] | undefined,
+  options: RequestInit | undefined,
   response: Response,
   token: string,
   baseUrl: string,
@@ -110,7 +58,7 @@ function observeResponse(
 ): void {
   if (requestUrl.includes(SUBMIT_PATH)) {
     if (!response.ok) return;
-    const sessionId = getSessionIdFromBody(submitBody);
+    const sessionId = getSessionIdFromBody(options?.body);
     if (sessionId) ensureTokenRefreshMonitor(sessionId, token, baseUrl, chrome);
     return;
   }
@@ -161,15 +109,16 @@ export function createMasFetch({ baseUrl, chrome, fetchImpl }: { baseUrl: string
       throw new Error('User is not authenticated');
     }
 
-    const submitBody = isSubmit ? await readSubmitBody(input, options) : undefined;
-
     const response = await (fetchImpl ?? ((i, o) => fetch(i, o)))(input, {
       ...options,
-      headers: buildHeaders(input, options, token),
+      headers: {
+        ...options?.headers,
+        Authorization: `Bearer ${token}`,
+      },
     });
 
     try {
-      observeResponse(requestUrl, submitBody, response, token, baseUrl, chrome);
+      observeResponse(requestUrl, options, response, token, baseUrl, chrome);
     } catch (err) {
       console.warn('[MAS token-refresh] could not update the monitor for this request', err);
     }
